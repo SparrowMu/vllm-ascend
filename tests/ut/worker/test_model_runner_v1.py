@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.offloader.base import NoopOffloader
 from vllm.sampling_params import SamplingParams
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -59,6 +60,34 @@ from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+
+
+class TestPPIntermediateLayout(unittest.TestCase):
+    def test_receive_and_dummy_layout_match_model_transport(self):
+        for model_type in ("glm_moe_dsa", "deepseek_v3"):
+            for sp in (False, True):
+                for num_tokens in (3, 4):
+                    with self.subTest(model_type=model_type, sp=sp, num_tokens=num_tokens):
+                        runner = NPUModelRunner.__new__(NPUModelRunner)
+                        runner.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type))
+                        runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2))
+                        runner.intermediate_tensors = IntermediateTensors(
+                            {key: torch.zeros(4, 2) for key in ("hidden_states", "residual")}
+                        )
+                        expected_len = num_tokens if model_type == "glm_moe_dsa" or not sp else (num_tokens + 1) // 2
+                        incoming = IntermediateTensors(
+                            {
+                                key: torch.arange(expected_len * 2).reshape(expected_len, 2).float() + offset
+                                for key, offset in (("hidden_states", 0), ("residual", 100))
+                            }
+                        )
+                        with patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=sp):
+                            self.assertEqual(runner._pp_intermediate_token_count(num_tokens), expected_len)
+                            output = runner.sync_and_gather_intermediate_tensors(num_tokens, incoming, True)
+                            dummy = runner.sync_and_gather_intermediate_tensors(num_tokens, None, False)
+                        for key in ("hidden_states", "residual"):
+                            torch.testing.assert_close(output[key], incoming[key])
+                            torch.testing.assert_close(dummy[key], incoming[key])
 
 
 class DenseAttentionBackend(AscendAttentionBackend):
@@ -1220,6 +1249,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         return runner
 
     def _check_load_model_prolog_budget(self, with_draft, pcp_enabled):
+        """Check persistent writer weights are counted during model loading."""
         runner = self._build_runner()
         runner.model_config.model = "test-model"
         runner.model_config.multimodal_config = None
@@ -1254,6 +1284,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             impl.v_head_dim = 1
             impl.enable_mlapo = False
             impl.fa_quant_layer = False
+            impl.use_flashmla = False
             impl.pcp_enabled = pcp_enabled
             impl.dcp_enabled = False
             impl.supports_prolog_v3_writer = lambda: True
@@ -1361,7 +1392,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         torch.nn.Module.__init__(attn_module)
         attn_module.impl = SimpleNamespace(
             fa_quant_layer=False,
-            supports_prolog_v3_writer=lambda: True,
+            supports_prolog_v3_writer=lambda: False,
+            supports_strided_mla_writer=lambda: True,
         )
         runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: attn_module})
         runner.kernel_block_sizes = [128]
@@ -1497,7 +1529,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             dcp_enabled=False,
             pcp_enabled=False,
             is_pcp_decode_sharded=False,
-            supports_prolog_v3_writer=lambda: False,
+            supports_strided_mla_writer=lambda: False,
         )
         runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: attn_module})
 
@@ -1531,7 +1563,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         attn_module.impl.is_pcp_decode_sharded = False
 
         attn_module.impl.dcp_enabled = True
-        attn_module.impl.supports_prolog_v3_writer = lambda: True
+        attn_module.impl.supports_strided_mla_writer = lambda: True
         runner.vllm_config.scheduler_config.max_num_batched_tokens = 16384
         attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: False
         with patch(
@@ -1553,7 +1585,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             self.assertTrue(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
         attn_module.impl._dcp_current_kv_buffers = None
         attn_module.impl.dcp_enabled = False
-        attn_module.impl.supports_prolog_v3_writer = lambda: True
+        attn_module.impl.supports_strided_mla_writer = lambda: True
         with patch(
             "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
             return_value=True,
